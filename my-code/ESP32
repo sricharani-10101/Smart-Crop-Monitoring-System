@@ -1,90 +1,148 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
-// Replace with your network credentials
-const char* ssid = "REPLACE_WITH_YOUR_SSID";
-const char* password = "REPLACE_WITH_YOUR_PASSWORD";
+//================ WIFI ==================
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// Replace with your ThingSpeak API Key
-String serverName = "http://api.thingspeak.com/update?api_key=REPLACE_WITH_YOUR_API_KEY";
+//============= THINGSPEAK ==============
+String apiKey = "TULLQ1V8L4Y0CVXO";
+String server = "http://api.thingspeak.com/update?api_key=" + TULLQ1V8L4Y0CVXO;
 
-// Timer setup
+//============== DHT11 ==================
+#define DHTPIN 26
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+//============= SENSOR PINS ============
+#define SOIL_PIN 34
+#define RAIN_PIN 35
+#define WATER_PIN 32
+#define RELAY_PIN 25
+
+//============== LCD ===================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//============== TIMER =================
 unsigned long lastTime = 0;
-const unsigned long timerDelay = 3000; // 3 seconds delay
-
-// DHT Sensor setup
-#define DHT_PIN 26           // Pin connected to the DHT sensor (change if necessary)
-#define DHT_TYPE DHT11       // DHT11 or DHT22 (change if you're using a DHT11)
-
-DHT dht(DHT_PIN, DHT_TYPE); // Initialize DHT sensor
+unsigned long timerDelay = 15000;   // ThingSpeak minimum = 15 sec
 
 WiFiClient client;
 HTTPClient http;
 
 void setup() {
+
   Serial.begin(115200);
 
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  Serial.println("Connecting to WiFi...");
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);      // Pump OFF (Active LOW relay)
 
-  while (WiFi.status() != WL_CONNECTED) {
+  dht.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0,0);
+  lcd.print("Connecting...");
+
+  WiFi.begin(ssid, password);
+
+  while(WiFi.status() != WL_CONNECTED){
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println();
-  Serial.print("Connected to WiFi, IP Address: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("WiFi Connected");
 
-  // Initialize the DHT sensor
-  dht.begin();
-
-  // Initial message for clarity
-  Serial.println("Timer set to 10 seconds. It will take 10 seconds before publishing the first reading.");
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("WiFi Connected");
+  delay(1500);
 }
 
 void loop() {
-  // Check if it's time to send a new HTTP request
-  if (millis() - lastTime >= timerDelay) {
-    if (WiFi.status() == WL_CONNECTED) {
-      // Read temperature and humidity from DHT sensor
-      float temperature = dht.readTemperature();  // Get temperature in Celsius
-      float humidity = dht.readHumidity();       // Get humidity percentage
 
-      // Check if reading was successful
-      if (isnan(temperature) || isnan(humidity)) {
-        Serial.println("Failed to read from DHT sensor!");
-        return;
-      }
+  if(millis() - lastTime > timerDelay){
 
-      // Construct the server path with temperature and humidity data
-      String serverPath = serverName + "&field1=" + String(temperature) + "&field2=" + String(humidity);
+    //========== Read Sensors ==========
+    float temp = dht.readTemperature();
+    float hum  = dht.readHumidity();
 
-      // Start HTTP request
-      http.begin(client, serverPath.c_str());
+    int soilRaw = analogRead(SOIL_PIN);
+    int rainRaw = analogRead(RAIN_PIN);
+    int waterRaw = analogRead(WATER_PIN);
 
-      // Send HTTP GET request
-      int httpResponseCode = http.GET();
+    // Convert to %
+    int soilPercent = map(soilRaw, 4095, 1200, 0, 100);
+    soilPercent = constrain(soilPercent,0,100);
 
-      if (httpResponseCode > 0) {
-        Serial.print("HTTP Response code: ");
-        Serial.println(httpResponseCode);
-        String payload = http.getString();
-        Serial.println(payload);  // Print the response payload
-      } else {
-        Serial.print("Error code: ");
-        Serial.println(httpResponseCode);  // Error code if request failed
-      }
+    int rainPercent = map(rainRaw,4095,0,0,100);
+    rainPercent = constrain(rainPercent,0,100);
 
-      // End the HTTP request and free resources
-      http.end();
-    } else {
-      Serial.println("WiFi Disconnected");
+    int waterPercent = map(waterRaw,0,4095,0,100);
+    waterPercent = constrain(waterPercent,0,100);
+
+    //========== Pump Control ==========
+    if(soilPercent < 30 && rainPercent < 30 && waterPercent > 20){
+      digitalWrite(RELAY_PIN, LOW);      // Pump ON
+    }
+    else{
+      digitalWrite(RELAY_PIN, HIGH);     // Pump OFF
     }
 
-    // Update lastTime to manage the delay
+    //========== Serial Monitor ==========
+    Serial.println("-------------------------");
+    Serial.print("Temp: "); Serial.println(temp);
+    Serial.print("Humidity: "); Serial.println(hum);
+    Serial.print("Soil: "); Serial.print(soilPercent); Serial.println("%");
+    Serial.print("Rain: "); Serial.print(rainPercent); Serial.println("%");
+    Serial.print("Water: "); Serial.print(waterPercent); Serial.println("%");
+
+    //========== LCD ==========
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("T:");
+    lcd.print(temp,1);
+    lcd.print(" H:");
+    lcd.print((int)hum);
+
+    lcd.setCursor(0,1);
+    lcd.print("S:");
+    lcd.print(soilPercent);
+    lcd.print("% ");
+
+    if(digitalRead(RELAY_PIN)==LOW)
+      lcd.print("ON");
+    else
+      lcd.print("OFF");
+
+    //========== ThingSpeak ==========
+    if(WiFi.status()==WL_CONNECTED){
+
+      String url = server +
+             "&field1=" + String(soilPercent) +
+             "&field2=" + String(temp) +
+             "&field3=" + String(hum) +
+             "&field4=" + String(rainPercent) +
+             "&field5=" + String(waterPercent);
+
+      http.begin(client,url);
+      int code = http.GET();
+
+      if(code>0){
+        Serial.print("HTTP: ");
+        Serial.println(code);
+      }
+      else{
+        Serial.println("Upload Failed");
+      }
+
+      http.end();
+    }
+
     lastTime = millis();
   }
 }
