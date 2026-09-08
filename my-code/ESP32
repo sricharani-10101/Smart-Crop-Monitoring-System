@@ -1,148 +1,132 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <DHT.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
-//================ WIFI ==================
-const char* ssid = "YOUR_WIFI_NAME";
-const char* password = "YOUR_WIFI_PASSWORD";
-
-//============= THINGSPEAK ==============
-String apiKey = "TULLQ1V8L4Y0CVXO";
-String server = "http://api.thingspeak.com/update?api_key=" + TULLQ1V8L4Y0CVXO;
-
-//============== DHT11 ==================
+// -------------------------
+// DHT11 SETTINGS
+// -------------------------
 #define DHTPIN 26
 #define DHTTYPE DHT11
+
 DHT dht(DHTPIN, DHTTYPE);
 
-//============= SENSOR PINS ============
-#define SOIL_PIN 34
-#define RAIN_PIN 35
-#define WATER_PIN 32
-#define RELAY_PIN 25
+// -------------------------
+// WIFI DETAILS
+// -------------------------
+const char* ssid = "";
+const char* password = "";
 
-//============== LCD ===================
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// -------------------------
+// THINGSPEAK API KEY
+// -------------------------
+String apiKey = "";
 
-//============== TIMER =================
-unsigned long lastTime = 0;
-unsigned long timerDelay = 15000;   // ThingSpeak minimum = 15 sec
+// Counter to track readings
+int readingCount = 0;
 
-WiFiClient client;
-HTTPClient http;
+// Maximum number of readings
+const int maxReadings = 20;
+
 
 void setup() {
 
   Serial.begin(115200);
-
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);      // Pump OFF (Active LOW relay)
-
   dht.begin();
 
-  lcd.init();
-  lcd.backlight();
+  Serial.println("Smart Crop Monitoring System Starting...");
 
-  lcd.setCursor(0,0);
-  lcd.print("Connecting...");
-
+  // Connect to WiFi
   WiFi.begin(ssid, password);
 
-  while(WiFi.status() != WL_CONNECTED){
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println("WiFi Connected");
-
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("WiFi Connected");
-  delay(1500);
+  Serial.println();
+  Serial.println("WiFi Connected!");
 }
+
 
 void loop() {
 
-  if(millis() - lastTime > timerDelay){
+  // Stop after 20 readings
+  if (readingCount >= maxReadings) {
 
-    //========== Read Sensors ==========
-    float temp = dht.readTemperature();
-    float hum  = dht.readHumidity();
+    Serial.println("20 readings completed!");
+    Serial.println("Program stopped.");
 
-    int soilRaw = analogRead(SOIL_PIN);
-    int rainRaw = analogRead(RAIN_PIN);
-    int waterRaw = analogRead(WATER_PIN);
-
-    // Convert to %
-    int soilPercent = map(soilRaw, 4095, 1200, 0, 100);
-    soilPercent = constrain(soilPercent,0,100);
-
-    int rainPercent = map(rainRaw,4095,0,0,100);
-    rainPercent = constrain(rainPercent,0,100);
-
-    int waterPercent = map(waterRaw,0,4095,0,100);
-    waterPercent = constrain(waterPercent,0,100);
-
-    //========== Pump Control ==========
-    if(soilPercent < 30 && rainPercent < 30 && waterPercent > 20){
-      digitalWrite(RELAY_PIN, LOW);      // Pump ON
+    while (true) {
+      // ESP32 stays here and stops taking new readings
+      delay(1000);
     }
-    else{
-      digitalWrite(RELAY_PIN, HIGH);     // Pump OFF
-    }
+  }
 
-    //========== Serial Monitor ==========
-    Serial.println("-------------------------");
-    Serial.print("Temp: "); Serial.println(temp);
-    Serial.print("Humidity: "); Serial.println(hum);
-    Serial.print("Soil: "); Serial.print(soilPercent); Serial.println("%");
-    Serial.print("Rain: "); Serial.print(rainPercent); Serial.println("%");
-    Serial.print("Water: "); Serial.print(waterPercent); Serial.println("%");
 
-    //========== LCD ==========
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("T:");
-    lcd.print(temp,1);
-    lcd.print(" H:");
-    lcd.print((int)hum);
+  // Read temperature and humidity
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
 
-    lcd.setCursor(0,1);
-    lcd.print("S:");
-    lcd.print(soilPercent);
-    lcd.print("% ");
 
-    if(digitalRead(RELAY_PIN)==LOW)
-      lcd.print("ON");
-    else
-      lcd.print("OFF");
+  // Check sensor
+  if (isnan(humidity) || isnan(temperature)) {
 
-    //========== ThingSpeak ==========
-    if(WiFi.status()==WL_CONNECTED){
+    Serial.println("Failed to read from DHT11!");
+    delay(2000);
+    return;
+  }
 
-      String url = server +
-             "&field1=" + String(soilPercent) +
-             "&field2=" + String(temp) +
-             "&field3=" + String(hum) +
-             "&field4=" + String(rainPercent) +
-             "&field5=" + String(waterPercent);
 
-      http.begin(client,url);
-      int code = http.GET();
+  // Display reading number
+  Serial.print("Reading Number: ");
+  Serial.println(readingCount + 1);
 
-      if(code>0){
-        Serial.print("HTTP: ");
-        Serial.println(code);
-      }
-      else{
-        Serial.println("Upload Failed");
-      }
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
 
-      http.end();
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+
+  // Send data to ThingSpeak
+  if (WiFi.status() == WL_CONNECTED) {
+
+    HTTPClient http;
+
+    String serverPath =
+      "http://api.thingspeak.com/update?api_key=" +
+      apiKey +
+      "&field1=" + String(temperature) +
+      "&field2=" + String(humidity);
+
+    http.begin(serverPath);
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+
+      Serial.println("Data sent to ThingSpeak successfully!");
+
+    } else {
+
+      Serial.print("Error sending data: ");
+      Serial.println(httpResponseCode);
     }
 
-    lastTime = millis();
+    http.end();
+  }
+
+
+  // Increase reading count
+  readingCount++;
+
+
+  // Wait 15 seconds before next reading
+  if (readingCount < maxReadings) {
+    delay(15000);
   }
 }
