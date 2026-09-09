@@ -1,0 +1,504 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// =====================================================
+// Wi-Fi DETAILS
+// =====================================================
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ThingSpeak Write API Key
+const char* THINGSPEAK_API_KEY = "YOUR_THINGSPEAK_WRITE_API_KEY";
+
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+#define DHT_PIN 26
+#define DHT_TYPE DHT11
+
+#define SOIL_PIN 33
+#define RAIN_PIN 23
+
+#define RELAY_PIN 4
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+
+// =====================================================
+// SOIL MOISTURE CALIBRATION
+// =====================================================
+
+// CHANGE THESE AFTER CALIBRATION
+
+int SOIL_DRY = 3200;
+int SOIL_WET = 1200;
+
+
+// =====================================================
+// RAIN SENSOR CALIBRATION
+// =====================================================
+
+// CHANGE THESE AFTER TESTING
+
+int RAIN_DRY = 4095;
+int RAIN_WET = 1500;
+
+
+// =====================================================
+// IRRIGATION SETTINGS
+// =====================================================
+
+// Soil moisture below this value = irrigation required
+int MOISTURE_THRESHOLD = 35;
+
+// Soil moisture above this value = sufficient moisture
+int MOISTURE_STOP = 55;
+
+
+// =====================================================
+// RELAY SETTINGS
+// =====================================================
+
+// Most relay modules are ACTIVE LOW.
+// If your relay works opposite, change this.
+
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
+
+
+// =====================================================
+// TIMING
+// =====================================================
+
+unsigned long lastThingSpeakUpdate = 0;
+
+// ThingSpeak generally requires at least 15 seconds
+// between updates on the free service.
+const unsigned long THINGSPEAK_INTERVAL = 20000;
+
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+float temperature = 0;
+float humidity = 0;
+
+int soilRaw = 0;
+int rainRaw = 0;
+
+int soilMoisture = 0;
+int rainPercentage = 0;
+
+bool pumpStatus = false;
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
+  // I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Irrigation");
+
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+
+  delay(2000);
+
+  // DHT
+  dht.begin();
+
+  // Wi-Fi
+  connectWiFi();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+
+  delay(1500);
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // READ SOIL MOISTURE
+  // ---------------------------------------------------
+
+  soilRaw = analogRead(SOIL_PIN);
+
+  soilMoisture = map(
+    soilRaw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  soilMoisture = constrain(soilMoisture, 0, 100);
+
+
+  // ---------------------------------------------------
+  // READ RAIN SENSOR
+  // ---------------------------------------------------
+
+  rainRaw = analogRead(RAIN_PIN);
+
+  rainPercentage = map(
+    rainRaw,
+    RAIN_DRY,
+    RAIN_WET,
+    0,
+    100
+  );
+
+  rainPercentage = constrain(rainPercentage, 0, 100);
+
+
+  // ---------------------------------------------------
+  // READ DHT11
+  // ---------------------------------------------------
+
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+
+
+  // Check if DHT11 reading failed
+
+  if (isnan(humidity) || isnan(temperature))
+  {
+    Serial.println("DHT11 reading failed!");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("DHT11 Error");
+
+    delay(2000);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // DISPLAY SENSOR DATA
+  // ---------------------------------------------------
+
+  displaySensorData();
+
+
+  // ---------------------------------------------------
+  // IRRIGATION CONTROL
+  // ---------------------------------------------------
+
+  irrigationControl();
+
+
+  // ---------------------------------------------------
+  // SERIAL MONITOR
+  // ---------------------------------------------------
+
+  printSerialData();
+
+
+  // ---------------------------------------------------
+  // THINGSPEAK UPDATE
+  // ---------------------------------------------------
+
+  if (millis() - lastThingSpeakUpdate >= THINGSPEAK_INTERVAL)
+  {
+    sendToThingSpeak();
+
+    lastThingSpeakUpdate = millis();
+  }
+
+
+  delay(2000);
+}
+
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.print("Connecting to Wi-Fi");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  {
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println("Wi-Fi connection failed.");
+    Serial.println("System will continue locally.");
+  }
+}
+
+
+// =====================================================
+// SENSOR DISPLAY
+// =====================================================
+
+void displaySensorData()
+{
+  // First screen
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Soil:");
+  lcd.print(soilMoisture);
+  lcd.print("%");
+
+  lcd.setCursor(9, 0);
+  lcd.print("Rain:");
+  lcd.print(rainPercentage);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C ");
+
+  lcd.print("H:");
+  lcd.print(humidity, 0);
+  lcd.print("%");
+
+  delay(2000);
+
+
+  // Second screen
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Pump:");
+
+  if (pumpStatus)
+  {
+    lcd.print("ON");
+  }
+  else
+  {
+    lcd.print("OFF");
+  }
+
+  lcd.setCursor(0, 1);
+
+  if (rainPercentage > 20)
+  {
+    lcd.print("Rain Detected");
+  }
+  else
+  {
+    lcd.print("No Rain");
+  }
+}
+
+
+// =====================================================
+// IRRIGATION CONTROL
+// =====================================================
+
+void irrigationControl()
+{
+  /*
+    Pump should turn ON when:
+
+    1. Soil is dry
+    2. Significant rain is NOT detected
+
+    Pump turns OFF when:
+
+    1. Soil moisture becomes sufficient
+    OR
+    2. Rain is detected
+  */
+
+
+  if (soilMoisture <= MOISTURE_THRESHOLD &&
+      rainPercentage < 20)
+  {
+    pumpStatus = true;
+
+    digitalWrite(RELAY_PIN, RELAY_ON);
+
+    Serial.println("IRRIGATION: PUMP ON");
+  }
+
+
+  else if (soilMoisture >= MOISTURE_STOP ||
+           rainPercentage >= 20)
+  {
+    pumpStatus = false;
+
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+
+    Serial.println("IRRIGATION: PUMP OFF");
+  }
+}
+
+
+// =====================================================
+// SERIAL MONITOR
+// =====================================================
+
+void printSerialData()
+{
+  Serial.println();
+  Serial.println("========== SENSOR DATA ==========");
+
+  Serial.print("Soil Raw Value: ");
+  Serial.println(soilRaw);
+
+  Serial.print("Soil Moisture: ");
+  Serial.print(soilMoisture);
+  Serial.println("%");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println("%");
+
+  Serial.print("Rain Raw Value: ");
+  Serial.println(rainRaw);
+
+  Serial.print("Rain: ");
+  Serial.print(rainPercentage);
+  Serial.println("%");
+
+  Serial.print("Pump: ");
+
+  if (pumpStatus)
+  {
+    Serial.println("ON");
+  }
+  else
+  {
+    Serial.println("OFF");
+  }
+
+  Serial.println("=================================");
+}
+
+
+// =====================================================
+// THINGSPEAK
+// =====================================================
+
+void sendToThingSpeak()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi unavailable.");
+    Serial.println("Skipping ThingSpeak update.");
+
+    // Important:
+    // Local irrigation continues even without Wi-Fi.
+
+    return;
+  }
+
+
+  HTTPClient http;
+
+
+  String url = "https://api.thingspeak.com/update?api_key=";
+
+  url += THINGSPEAK_API_KEY;
+
+  url += "&field1=";
+  url += String(soilMoisture);
+
+  url += "&field2=";
+  url += String(temperature, 1);
+
+  url += "&field3=";
+  url += String(humidity, 1);
+
+  url += "&field4=";
+  url += String(rainPercentage);
+
+
+  Serial.println();
+  Serial.println("Sending data to ThingSpeak...");
+
+  http.begin(url);
+
+  int httpResponseCode = http.GET();
+
+
+  if (httpResponseCode > 0)
+  {
+    String response = http.getString();
+
+    Serial.print("ThingSpeak Response: ");
+    Serial.println(response);
+  }
+  else
+  {
+    Serial.print("ThingSpeak Error: ");
+    Serial.println(httpResponseCode);
+  }
+
+
+  http.end();
+}
