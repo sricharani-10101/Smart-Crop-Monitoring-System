@@ -2,17 +2,18 @@
 #include <HTTPClient.h>
 #include <DHT.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
 
 // =====================================================
 // Wi-Fi DETAILS
 // =====================================================
 
-const char* WIFI_SSID = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "Vertigo";
+const char* WIFI_PASSWORD = "cantcommutenow";
 
 // ThingSpeak Write API Key
-const char* THINGSPEAK_API_KEY = "YOUR_THINGSPEAK_WRITE_API_KEY";
+const char* THINGSPEAK_API_KEY = "9COXDKE1A77EV6V3";
 
 
 // =====================================================
@@ -37,7 +38,7 @@ const char* THINGSPEAK_API_KEY = "YOUR_THINGSPEAK_WRITE_API_KEY";
 
 DHT dht(DHT_PIN, DHT_TYPE);
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+hd44780_I2Cexp lcd;
 
 
 // =====================================================
@@ -125,8 +126,16 @@ void setup()
   Wire.begin(SDA_PIN, SCL_PIN);
 
   // LCD
-  lcd.init();
-  lcd.backlight();
+  int status = lcd.begin(16, 2);
+
+if (status) {
+  Serial.print("LCD initialization failed, status = ");
+  Serial.println(status);
+  while (1);
+}
+
+lcd.backlight();
+lcd.clear();
 
   lcd.clear();
   lcd.setCursor(0, 0);
