@@ -1,0 +1,1392 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+
+// =====================================================
+// ESP32 ACCESS POINT SETTINGS
+// =====================================================
+
+const char* AP_SSID     = "Smart_Crop_Monitor";
+const char* AP_PASSWORD = "SmartCrop123";
+
+WebServer server(80);
+
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+#define DHT_PIN  26
+#define DHT_TYPE DHT11
+
+#define SOIL_PIN 33
+#define RAIN_PIN 35
+
+#define RELAY_PIN 4
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+hd44780_I2Cexp lcd;
+
+
+// =====================================================
+// SOIL MOISTURE CALIBRATION
+// =====================================================
+
+int SOIL_DRY = 3200;
+int SOIL_WET = 1200;
+
+
+// =====================================================
+// RAIN SENSOR CALIBRATION
+// =====================================================
+
+int RAIN_DRY = 4095;
+int RAIN_WET = 1500;
+
+
+// =====================================================
+// RELAY SETTINGS
+// =====================================================
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+
+// =====================================================
+// PLANT DATABASE
+//   Plant 1 : Portulaca           – ON < 40%  OFF >= 72%
+//   Plant 2 : Moses-in-the-cradle – ON < 55%  OFF >= 72%
+//   Plant 3 : Periwinkle          – ON < 47%  OFF >= 72%
+// =====================================================
+
+struct PlantProfile
+{
+  const char* name;
+  int         pumpOnBelow;   // start pump when soil % is below this
+  int         pumpOffAt;     // stop  pump when soil % reaches this
+};
+
+const PlantProfile PLANTS[3] =
+{
+  { "Portulaca",           40, 72 },  // Plant 1
+  { "Moses-in-the-cradle", 55, 72 },  // Plant 2
+  { "Periwinkle",          47, 72 }   // Plant 3
+};
+
+// Active plant – change to 1, 2, or 3 and re-upload to switch plant
+int SELECTED_PLANT = 1;
+
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+float temperature    = 0;
+float humidity       = 0;
+
+int   soilRaw        = 0;
+int   rainRaw        = 0;
+
+int   soilMoisture   = 0;
+int   rainPercentage = 0;
+
+bool  pumpStatus     = false;
+
+unsigned long readingCount = 0;
+
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+
+void startAccessPoint();
+void displaySensorData();
+void irrigationControl();
+void printSerialData();
+void handleRoot();
+void handleData();
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Clamp plant selection to valid range
+  if (SELECTED_PLANT < 1 || SELECTED_PLANT > 3)
+  {
+    SELECTED_PLANT = 1;
+  }
+
+
+  // ---------------------------------------------------
+  // RELAY
+  // ---------------------------------------------------
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
+
+  // ---------------------------------------------------
+  // I2C
+  // ---------------------------------------------------
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+
+  // ---------------------------------------------------
+  // LCD
+  // ---------------------------------------------------
+
+  int status = lcd.begin(16, 2);
+
+  if (status)
+  {
+    Serial.print("LCD initialization failed, status = ");
+    Serial.println(status);
+    // Continue even if LCD fails.
+  }
+  else
+  {
+    lcd.backlight();
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("Smart Irrigation");
+
+    lcd.setCursor(0, 1);
+    lcd.print("System Starting");
+
+    delay(2000);
+  }
+
+
+  // ---------------------------------------------------
+  // DHT11
+  // ---------------------------------------------------
+
+  dht.begin();
+
+
+  // ---------------------------------------------------
+  // ADC
+  // ---------------------------------------------------
+
+  analogReadResolution(12);
+
+
+  // ---------------------------------------------------
+  // START ESP32 HOTSPOT
+  // ---------------------------------------------------
+
+  startAccessPoint();
+
+
+  // ---------------------------------------------------
+  // WEB SERVER ROUTES
+  // ---------------------------------------------------
+
+  server.on("/",     handleRoot);
+  server.on("/data", handleData);
+
+  server.begin();
+
+  Serial.println("Web server started.");
+
+
+  // ---------------------------------------------------
+  // READY SCREEN
+  // ---------------------------------------------------
+
+  if (status == 0)
+  {
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Ready");
+
+    lcd.setCursor(0, 1);
+    lcd.print("192.168.4.1");
+
+    delay(2000);
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    String pLine = "P" + String(SELECTED_PLANT) + " Selected";
+    lcd.print(pLine);
+
+    lcd.setCursor(0, 1);
+    String pName = String(PLANTS[SELECTED_PLANT - 1].name);
+    if (pName.length() > 16) pName = pName.substring(0, 16);
+    lcd.print(pName);
+
+    delay(2000);
+  }
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // HANDLE WEB REQUESTS
+  // ---------------------------------------------------
+
+  server.handleClient();
+
+
+  // ---------------------------------------------------
+  // SOIL MOISTURE
+  // ---------------------------------------------------
+
+  soilRaw = analogRead(SOIL_PIN);
+
+  soilMoisture = map(
+    soilRaw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  soilMoisture = constrain(soilMoisture, 0, 100);
+
+
+  // ---------------------------------------------------
+  // RAIN SENSOR
+  // ---------------------------------------------------
+
+  rainRaw = analogRead(RAIN_PIN);
+
+  rainPercentage = map(
+    rainRaw,
+    RAIN_DRY,
+    RAIN_WET,
+    0,
+    100
+  );
+
+  rainPercentage = constrain(rainPercentage, 0, 100);
+
+
+  // ---------------------------------------------------
+  // DHT11
+  // ---------------------------------------------------
+
+  humidity    = dht.readHumidity();
+  temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature))
+  {
+    Serial.println("DHT11 reading failed!");
+    delay(1000);
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // INCREMENT READING COUNTER
+  // ---------------------------------------------------
+
+  readingCount++;
+
+
+  // ---------------------------------------------------
+  // IRRIGATION CONTROL
+  // ---------------------------------------------------
+
+  irrigationControl();
+
+
+  // ---------------------------------------------------
+  // DISPLAY
+  // ---------------------------------------------------
+
+  displaySensorData();
+
+
+  // ---------------------------------------------------
+  // SERIAL MONITOR
+  // ---------------------------------------------------
+
+  printSerialData();
+
+
+  delay(2000);
+}
+
+
+// =====================================================
+// START ESP32 ACCESS POINT
+// =====================================================
+
+void startAccessPoint()
+{
+  Serial.println();
+  Serial.println("Starting ESP32 Wi-Fi Hotspot...");
+
+  WiFi.mode(WIFI_AP);
+
+  bool result = WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  if (result)
+  {
+    Serial.println("Hotspot started successfully.");
+
+    Serial.print("Wi-Fi Name: ");
+    Serial.println(AP_SSID);
+
+    Serial.print("Wi-Fi Password: ");
+    Serial.println(AP_PASSWORD);
+
+    Serial.print("Dashboard IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+  else
+  {
+    Serial.println("Failed to start hotspot.");
+  }
+}
+
+
+
+
+
+
+// =====================================================
+// WEB DASHBOARD
+// =====================================================
+
+void handleRoot()
+{
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Crop Monitoring System</title>
+<style>
+
+/* =====================================================
+   RESET & BASE
+   ===================================================== */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg:          #f2f8f4;
+  --surface:     #ffffff;
+  --border:      #cce4d6;
+  --green-dk:    #256b45;
+  --green-md:    #3a9e6c;
+  --green-lt:    #d4efe1;
+  --green-xlt:   #eaf7f0;
+  --text-hd:     #133526;
+  --text-body:   #2a4a38;
+  --text-mute:   #628f77;
+  --red:         #c0392b;
+  --amber:       #c47d00;
+  --blue:        #2260a8;
+  --radius:      10px;
+  --radius-sm:   7px;
+  --shadow:      0 2px 12px rgba(0,0,0,0.07);
+  --shadow-md:   0 4px 20px rgba(0,0,0,0.10);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-body);
+  font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* =====================================================
+   PAGE WRAPPER
+   ===================================================== */
+
+.page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 22px 16px 40px;
+}
+
+/* =====================================================
+   HEADER
+   ===================================================== */
+
+.page-header {
+  background: var(--green-dk);
+  color: #ffffff;
+  border-radius: var(--radius);
+  padding: 18px 24px;
+  margin-bottom: 18px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  box-shadow: var(--shadow-md);
+}
+
+.page-header h1 {
+  font-size: clamp(17px, 3.5vw, 22px);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.page-header p {
+  font-size: 12px;
+  color: #a8d4be;
+  margin-top: 3px;
+}
+
+.live-badge {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: rgba(255,255,255,0.12);
+  padding: 6px 13px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #d0efe0;
+  letter-spacing: 0.5px;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #5ce89a;
+  animation: blink 1.8s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+
+
+
+/* =====================================================
+   STATUS BANNER
+   ===================================================== */
+
+.status-banner {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 5px solid var(--green-md);
+  border-radius: var(--radius);
+  padding: 16px 22px;
+  margin-bottom: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  align-items: flex-start;
+  box-shadow: var(--shadow);
+}
+
+.bstat {
+  min-width: 130px;
+}
+
+.bstat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-mute);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.bstat-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-hd);
+}
+
+/* =====================================================
+   METRIC CARDS
+   ===================================================== */
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+}
+
+.mc-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-mute);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.mc-value {
+  font-size: clamp(28px, 5vw, 36px);
+  font-weight: 700;
+  color: var(--text-hd);
+  line-height: 1;
+}
+
+.mc-unit {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-mute);
+  margin-left: 3px;
+}
+
+.mc-raw {
+  font-size: 11px;
+  color: #a0b8ac;
+  margin-top: 6px;
+}
+
+.mc-tag {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--green-lt);
+  color: var(--green-dk);
+  letter-spacing: 0.4px;
+}
+
+.mc-tag.t-dry   { background: #fde8e8; color: var(--red); }
+.mc-tag.t-wet   { background: var(--green-lt); color: var(--green-dk); }
+.mc-tag.t-high  { background: #fde8e8; color: var(--red); }
+.mc-tag.t-cool  { background: #e8f0fe; color: var(--blue); }
+.mc-tag.t-rain  { background: #e8f0fe; color: var(--blue); }
+.mc-tag.t-warn  { background: #fef3e2; color: var(--amber); }
+
+/* PUMP CARD */
+.pump-card {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  align-items: center;
+}
+
+.pump-state {
+  font-size: clamp(22px, 4vw, 28px);
+  font-weight: 700;
+}
+
+.pump-reason {
+  font-size: 13px;
+  color: var(--text-mute);
+  margin-top: 5px;
+}
+
+/* =====================================================
+   PROGRESS BAR
+   ===================================================== */
+
+.prog-wrap {
+  margin-top: 12px;
+}
+
+.prog-bg {
+  height: 7px;
+  background: var(--green-lt);
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+
+.prog-fill {
+  height: 100%;
+  border-radius: 6px;
+  background: var(--green-md);
+  transition: width 0.5s ease, background 0.3s ease;
+}
+
+/* =====================================================
+   CHART SECTION
+   ===================================================== */
+
+.section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.3px;
+  color: var(--text-mute);
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.chart-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+}
+
+.chart-card h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-mute);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.chart-canvas {
+  display: block;
+  width: 100%;
+  height: 110px;
+}
+
+/* =====================================================
+   FOOTER
+   ===================================================== */
+
+.footer {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-mute);
+  margin-top: 12px;
+}
+
+/* =====================================================
+   RESPONSIVE
+   ===================================================== */
+
+@media (max-width: 560px) {
+  .page-header h1  { font-size: 16px; }
+  .mc-value        { font-size: 26px; }
+  .bstat-value     { font-size: 16px; }
+  .pump-card       { grid-column: span 1; }
+}
+
+</style>
+</head>
+
+<body>
+<div class="page">
+
+  <!-- HEADER -->
+  <div class="page-header">
+    <div>
+      <h1>Smart Crop Monitoring System</h1>
+      <p>ESP32 Local Agricultural Monitor &nbsp;&bull;&nbsp; 192.168.4.1</p>
+    </div>
+    <div class="live-badge">
+      <span class="live-dot"></span>
+      ESP32 LIVE
+    </div>
+  </div>
+
+
+  <!-- STATUS BANNER -->
+  <div class="status-banner">
+    <div class="bstat">
+      <div class="bstat-label">System Status</div>
+      <div class="bstat-value" id="systemStatus">Checking...</div>
+    </div>
+    <div class="bstat">
+      <div class="bstat-label">Active Plant</div>
+      <div class="bstat-value" id="plantName">--</div>
+    </div>
+    <div class="bstat">
+      <div class="bstat-label">Plant Code</div>
+      <div class="bstat-value" id="plantCode">--</div>
+    </div>
+    <div class="bstat">
+      <div class="bstat-label">Pump ON Below</div>
+      <div class="bstat-value" id="threshOn">--%</div>
+    </div>
+    <div class="bstat">
+      <div class="bstat-label">Pump OFF At</div>
+      <div class="bstat-value" id="threshOff">--%</div>
+    </div>
+    <div class="bstat">
+      <div class="bstat-label">Total Readings</div>
+      <div class="bstat-value" id="readingCount">0</div>
+    </div>
+  </div>
+
+
+  <!-- METRIC CARDS -->
+  <div class="metric-grid">
+
+    <!-- SOIL -->
+    <div class="metric-card">
+      <div class="mc-label">Soil Moisture</div>
+      <div class="mc-value">
+        <span id="soil">--</span><span class="mc-unit">%</span>
+      </div>
+      <div class="mc-raw" id="soilRawLbl">ADC: --</div>
+      <div class="prog-wrap">
+        <div class="prog-bg">
+          <div class="prog-fill" id="soilBar" style="width:0%"></div>
+        </div>
+      </div>
+      <span class="mc-tag" id="soilTag">--</span>
+    </div>
+
+    <!-- TEMPERATURE -->
+    <div class="metric-card">
+      <div class="mc-label">Temperature</div>
+      <div class="mc-value">
+        <span id="temperature">--</span><span class="mc-unit">&#176;C</span>
+      </div>
+      <div class="mc-raw">DHT11 Sensor</div>
+      <div class="prog-wrap">
+        <div class="prog-bg">
+          <div class="prog-fill" id="tempBar" style="width:0%"></div>
+        </div>
+      </div>
+      <span class="mc-tag" id="tempTag">--</span>
+    </div>
+
+    <!-- HUMIDITY -->
+    <div class="metric-card">
+      <div class="mc-label">Air Humidity</div>
+      <div class="mc-value">
+        <span id="humidity">--</span><span class="mc-unit">%</span>
+      </div>
+      <div class="mc-raw">DHT11 Sensor</div>
+      <div class="prog-wrap">
+        <div class="prog-bg">
+          <div class="prog-fill" id="humidityBar" style="width:0%"></div>
+        </div>
+      </div>
+      <span class="mc-tag">Air Humidity</span>
+    </div>
+
+    <!-- RAIN -->
+    <div class="metric-card">
+      <div class="mc-label">Rain Detection</div>
+      <div class="mc-value">
+        <span id="rain">--</span><span class="mc-unit">%</span>
+      </div>
+      <div class="mc-raw" id="rainRawLbl">ADC: --</div>
+      <div class="prog-wrap">
+        <div class="prog-bg">
+          <div class="prog-fill" id="rainBar" style="width:0%"></div>
+        </div>
+      </div>
+      <span class="mc-tag" id="rainTag">--</span>
+    </div>
+
+    <!-- PUMP -->
+    <div class="metric-card pump-card">
+      <div>
+        <div class="mc-label">Irrigation Pump</div>
+        <div class="pump-state" id="pump">--</div>
+        <div class="pump-reason" id="pumpReason">Waiting for irrigation decision...</div>
+      </div>
+    </div>
+
+  </div>
+
+
+  <!-- GRAPHS -->
+  <div class="section-title">Sensor History &ndash; Last 20 Readings</div>
+  <div class="chart-grid">
+
+    <div class="chart-card">
+      <h3>Soil Moisture (%)</h3>
+      <canvas class="chart-canvas" id="cSoil"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Temperature (&#176;C)</h3>
+      <canvas class="chart-canvas" id="cTemp"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Air Humidity (%)</h3>
+      <canvas class="chart-canvas" id="cHum"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Rain Detection (%)</h3>
+      <canvas class="chart-canvas" id="cRain"></canvas>
+    </div>
+
+  </div>
+
+
+  <!-- FOOTER -->
+  <div class="footer">
+    Smart Crop Monitoring System &nbsp;&bull;&nbsp;
+    ESP32 Local Dashboard &nbsp;&bull;&nbsp;
+    Auto-refresh every 2 s &nbsp;&bull;&nbsp;
+    Last update: <span id="lastUpdate">--</span>
+  </div>
+
+</div><!-- /page -->
+
+<script>
+
+// =========================================================
+// CHART HELPERS
+// =========================================================
+
+var MAX_PTS = 20;
+
+var hSoil = [], hTemp = [], hHum = [], hRain = [];
+
+function pushArr(arr, val) {
+  arr.push(val);
+  if (arr.length > MAX_PTS) arr.shift();
+}
+
+// Draw a simple line/fill chart on a canvas
+function drawChart(id, data, lineColor, fillColor, yMin, yMax) {
+  var c = document.getElementById(id);
+  if (!c) return;
+  var dpr = window.devicePixelRatio || 1;
+  var W   = c.offsetWidth;
+  var H   = 110;
+  c.width  = W * dpr;
+  c.height = H * dpr;
+  c.style.height = H + 'px';
+  var ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  var padL = 30, padR = 8, padT = 8, padB = 22;
+  var iW = W - padL - padR;
+  var iH = H - padT - padB;
+
+  // Y grid lines + labels
+  var gridSteps = [0, 25, 50, 75, 100];
+  ctx.font = '9px Segoe UI, Arial';
+  ctx.fillStyle = '#8aac9a';
+  ctx.strokeStyle = '#d4efe1';
+  ctx.lineWidth = 1;
+  gridSteps.forEach(function(g) {
+    var y = padT + iH * (1 - (g - yMin) / (yMax - yMin));
+    if (y < padT || y > padT + iH) return;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + iW, y);
+    ctx.stroke();
+    ctx.fillText(g, 0, y + 3);
+  });
+
+  if (data.length < 2) return;
+
+  function px(i)  { return padL + i / (MAX_PTS - 1) * iW; }
+  function py(v)  { return padT + iH * (1 - (v - yMin) / (yMax - yMin)); }
+
+  // Fill
+  var grad = ctx.createLinearGradient(0, padT, 0, padT + iH);
+  grad.addColorStop(0, fillColor);
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+
+  ctx.beginPath();
+  var offset = MAX_PTS - data.length;
+  ctx.moveTo(px(offset), padT + iH);
+  for (var i = 0; i < data.length; i++) {
+    ctx.lineTo(px(offset + i), py(data[i]));
+  }
+  ctx.lineTo(px(offset + data.length - 1), padT + iH);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  for (var i = 0; i < data.length; i++) {
+    var x = px(offset + i), y = py(data[i]);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // X-axis labels (start / mid / end)
+  ctx.fillStyle = '#8aac9a';
+  ctx.font = '9px Segoe UI, Arial';
+  ctx.fillText(1,              padL,        H - 6);
+  ctx.fillText(MAX_PTS / 2,    padL + iW/2, H - 6);
+  ctx.fillText(MAX_PTS,        padL + iW,   H - 6);
+}
+
+function redrawAll() {
+  drawChart('cSoil', hSoil, '#3a9e6c', 'rgba(58,158,108,0.18)', 0, 100);
+  drawChart('cTemp', hTemp, '#c0392b', 'rgba(192,57,43,0.15)',   0, 60);
+  drawChart('cHum',  hHum,  '#2260a8', 'rgba(34,96,168,0.15)',   0, 100);
+  drawChart('cRain', hRain, '#c47d00', 'rgba(196,125,0,0.15)',   0, 100);
+}
+
+window.addEventListener('resize', function() {
+  clearTimeout(window._rt);
+  window._rt = setTimeout(redrawAll, 150);
+});
+
+
+
+
+// =========================================================
+// TAG HELPER
+// =========================================================
+
+function setTag(id, text, cls) {
+  var el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'mc-tag' + (cls ? ' ' + cls : '');
+}
+
+// =========================================================
+// APPLY DATA
+// =========================================================
+
+function applyData(d) {
+  var s = parseFloat(d.soil);
+  var t = parseFloat(d.temperature);
+  var h = parseFloat(d.humidity);
+  var r = parseFloat(d.rain);
+
+  // Push history
+  pushArr(hSoil, s);
+  pushArr(hTemp, Math.min(t, 60));
+  pushArr(hHum,  h);
+  pushArr(hRain, r);
+
+  // Metrics
+  document.getElementById('soil').textContent        = d.soil;
+  document.getElementById('temperature').textContent = d.temperature;
+  document.getElementById('humidity').textContent    = d.humidity;
+  document.getElementById('rain').textContent        = d.rain;
+
+  document.getElementById('soilRawLbl').textContent =
+    d.soilRaw !== undefined ? 'ADC: ' + d.soilRaw : 'ADC: --';
+  document.getElementById('rainRawLbl').textContent =
+    d.rainRaw !== undefined ? 'ADC: ' + d.rainRaw : 'ADC: --';
+
+  // Progress bars
+  document.getElementById('soilBar').style.width     = s + '%';
+  document.getElementById('soilBar').style.background =
+    s < d.threshOn ? '#c0392b' : s >= d.threshOff ? '#3a9e6c' : '#c47d00';
+
+  var tPct = Math.min(Math.max(t / 50 * 100, 0), 100);
+  document.getElementById('tempBar').style.width     = tPct + '%';
+  document.getElementById('tempBar').style.background =
+    t < 20 ? '#2260a8' : t <= 35 ? '#3a9e6c' : '#c0392b';
+
+  document.getElementById('humidityBar').style.width = h + '%';
+
+  document.getElementById('rainBar').style.width     = r + '%';
+  document.getElementById('rainBar').style.background =
+    r >= 20 ? '#2260a8' : '#3a9e6c';
+
+  // Tags
+  var soilTagCls = s < d.threshOn ? 't-dry' : s >= d.threshOff ? 't-wet' : 't-warn';
+  setTag('soilTag', d.soilStatus, soilTagCls);
+
+  var tempTagCls = t < 20 ? 't-cool' : t <= 35 ? '' : 't-high';
+  setTag('tempTag', d.temperatureStatus, tempTagCls);
+
+  var rainTagCls = r >= 20 ? 't-rain' : '';
+  setTag('rainTag', d.rainStatus, rainTagCls);
+
+  // Pump
+  var pumpEl = document.getElementById('pump');
+  pumpEl.textContent  = d.pump;
+  pumpEl.style.color  = d.pump === 'ON' ? '#256b45' : '#628f77';
+
+  document.getElementById('pumpReason').textContent = d.pumpReason;
+
+  // Status banner
+  document.getElementById('systemStatus').textContent = d.systemStatus;
+  document.getElementById('plantName').textContent    = d.plantName;
+  document.getElementById('plantCode').textContent    = d.plantCode;
+  document.getElementById('threshOn').textContent     = d.threshOn + '%';
+  document.getElementById('threshOff').textContent    = d.threshOff + '%';
+  document.getElementById('readingCount').textContent = d.readingCount;
+
+  // Redraw charts
+  redrawAll();
+
+  // Timestamp
+  document.getElementById('lastUpdate').textContent =
+    new Date().toLocaleTimeString();
+}
+
+// =========================================================
+// FETCH LOOP
+// =========================================================
+
+function updateDashboard() {
+  fetch('/data', { cache: 'no-store' })
+    .then(function(r) { return r.json(); })
+    .then(applyData)
+    .catch(function(e) { console.warn('Fetch error:', e); });
+}
+
+setInterval(updateDashboard, 2000);
+updateDashboard();
+
+</script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+
+// =====================================================
+// SEND SENSOR DATA AS JSON
+// =====================================================
+
+void handleData()
+{
+  // No-cache headers
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+
+  const PlantProfile& plant = PLANTS[SELECTED_PLANT - 1];
+
+
+  // ---------------------------------------------------
+  // SOIL STATUS
+  // ---------------------------------------------------
+
+  String soilStatus;
+
+  if (soilMoisture < plant.pumpOnBelow)
+  {
+    soilStatus = "DRY";
+  }
+  else if (soilMoisture >= plant.pumpOffAt)
+  {
+    soilStatus = "WET";
+  }
+  else
+  {
+    soilStatus = "NORMAL";
+  }
+
+
+  // ---------------------------------------------------
+  // RAIN STATUS
+  // ---------------------------------------------------
+
+  String rainStatus = (rainPercentage >= 20) ? "RAIN DETECTED" : "NO RAIN";
+
+
+  // ---------------------------------------------------
+  // TEMPERATURE STATUS
+  // ---------------------------------------------------
+
+  String temperatureStatus;
+
+  if (temperature < 20)
+  {
+    temperatureStatus = "COOL";
+  }
+  else if (temperature <= 35)
+  {
+    temperatureStatus = "NORMAL";
+  }
+  else
+  {
+    temperatureStatus = "HIGH";
+  }
+
+
+  // ---------------------------------------------------
+  // PUMP REASON
+  // ---------------------------------------------------
+
+  String pumpReason;
+
+  if (pumpStatus)
+  {
+    pumpReason =
+      "Soil is dry and no significant rain detected.";
+  }
+  else if (rainPercentage >= 20)
+  {
+    pumpReason =
+      "Irrigation stopped because rain was detected.";
+  }
+  else if (soilMoisture >= plant.pumpOffAt)
+  {
+    pumpReason =
+      "Soil moisture is sufficient.";
+  }
+  else
+  {
+    pumpReason =
+      "Irrigation is currently on standby.";
+  }
+
+
+  // ---------------------------------------------------
+  // SYSTEM STATUS
+  // ---------------------------------------------------
+
+  String systemStatus;
+
+  if (pumpStatus)
+  {
+    systemStatus = "Irrigating";
+  }
+  else if (rainPercentage >= 20)
+  {
+    systemStatus = "Rain Detected - Paused";
+  }
+  else if (soilMoisture >= plant.pumpOffAt)
+  {
+    systemStatus = "Soil Sufficient - Standby";
+  }
+  else
+  {
+    systemStatus = "Monitoring";
+  }
+
+
+  // ---------------------------------------------------
+  // CREATE JSON
+  // ---------------------------------------------------
+
+  String json = "{";
+
+  json += "\"soil\":"            + String(soilMoisture);
+  json += ",\"temperature\":"    + String(temperature, 1);
+  json += ",\"humidity\":"       + String(humidity, 1);
+  json += ",\"rain\":"           + String(rainPercentage);
+
+  json += ",\"pump\":\""         + String(pumpStatus ? "ON" : "OFF") + "\"";
+  json += ",\"soilStatus\":\""   + soilStatus          + "\"";
+  json += ",\"rainStatus\":\""   + rainStatus          + "\"";
+  json += ",\"temperatureStatus\":\"" + temperatureStatus + "\"";
+  json += ",\"pumpReason\":\""   + pumpReason          + "\"";
+  json += ",\"systemStatus\":\"" + systemStatus        + "\"";
+
+  json += ",\"plantName\":\""    + String(plant.name)  + "\"";
+  json += ",\"plantCode\":"      + String(SELECTED_PLANT);
+  json += ",\"threshOn\":"       + String(plant.pumpOnBelow);
+  json += ",\"threshOff\":"      + String(plant.pumpOffAt);
+  json += ",\"readingCount\":"   + String(readingCount);
+
+  json += ",\"soilRaw\":"        + String(soilRaw);
+  json += ",\"rainRaw\":"        + String(rainRaw);
+
+  json += "}";
+
+
+  server.send(200, "application/json", json);
+}
+
+
+// =====================================================
+// LCD DISPLAY
+// =====================================================
+
+void displaySensorData()
+{
+  const PlantProfile& plant = PLANTS[SELECTED_PLANT - 1];
+
+  // ---------------------------------------------------
+  // SCREEN 1 – sensor readings
+  // ---------------------------------------------------
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Soil:");
+  lcd.print(soilMoisture);
+  lcd.print("%");
+
+  lcd.setCursor(9, 0);
+  lcd.print("Rain:");
+  lcd.print(rainPercentage);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C ");
+
+  lcd.print("H:");
+  lcd.print(humidity, 0);
+  lcd.print("%");
+
+  delay(1500);
+
+
+  // ---------------------------------------------------
+  // SCREEN 2 – plant & pump info
+  // ---------------------------------------------------
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  String pLine = "P" + String(SELECTED_PLANT) + ":" + String(plant.name);
+  if (pLine.length() > 16) pLine = pLine.substring(0, 16);
+  lcd.print(pLine);
+
+  lcd.setCursor(0, 1);
+  lcd.print("Pump:");
+  lcd.print(pumpStatus ? "ON " : "OFF");
+
+  if (rainPercentage >= 20)
+  {
+    lcd.print("Rain");
+  }
+  else
+  {
+    lcd.print("    ");
+  }
+}
+
+
+// =====================================================
+// IRRIGATION CONTROL
+// =====================================================
+
+void irrigationControl()
+{
+  const PlantProfile& plant = PLANTS[SELECTED_PLANT - 1];
+
+  /*
+    PUMP ON  : soil < pumpOnBelow  AND  rain < 20%
+    PUMP OFF : soil >= pumpOffAt   OR   rain >= 20%
+  */
+
+
+  // ---------------------------------------------------
+  // PUMP ON
+  // ---------------------------------------------------
+
+  if (
+    soilMoisture < plant.pumpOnBelow &&
+    rainPercentage < 20
+  )
+  {
+    pumpStatus = true;
+
+    digitalWrite(RELAY_PIN, RELAY_ON);
+
+    Serial.println("IRRIGATION: PUMP ON");
+  }
+
+
+  // ---------------------------------------------------
+  // PUMP OFF
+  // ---------------------------------------------------
+
+  else if (
+    soilMoisture >= plant.pumpOffAt ||
+    rainPercentage >= 20
+  )
+  {
+    pumpStatus = false;
+
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+
+    Serial.println("IRRIGATION: PUMP OFF");
+  }
+}
+
+
+// =====================================================
+// SERIAL MONITOR
+// =====================================================
+
+void printSerialData()
+{
+  const PlantProfile& plant = PLANTS[SELECTED_PLANT - 1];
+
+  Serial.println();
+  Serial.println("========== SENSOR DATA ==========");
+
+  Serial.print("Plant      : ");
+  Serial.print(SELECTED_PLANT);
+  Serial.print(" - ");
+  Serial.println(plant.name);
+
+  Serial.print("Thresholds : ON <");
+  Serial.print(plant.pumpOnBelow);
+  Serial.print("%  OFF >=");
+  Serial.print(plant.pumpOffAt);
+  Serial.println("%");
+
+  Serial.print("Reading #  : ");
+  Serial.println(readingCount);
+
+  Serial.print("Soil Raw   : ");
+  Serial.println(soilRaw);
+
+  Serial.print("Soil       : ");
+  Serial.print(soilMoisture);
+  Serial.println("%");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+
+  Serial.print("Humidity   : ");
+  Serial.print(humidity);
+  Serial.println("%");
+
+  Serial.print("Rain Raw   : ");
+  Serial.println(rainRaw);
+
+  Serial.print("Rain       : ");
+  Serial.print(rainPercentage);
+  Serial.println("%");
+
+  Serial.print("Pump       : ");
+  Serial.println(pumpStatus ? "ON" : "OFF");
+
+  Serial.println("=================================");
+}
