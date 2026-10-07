@@ -1,0 +1,1911 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+
+// =====================================================
+// ESP32 ACCESS POINT SETTINGS
+// =====================================================
+
+const char* AP_SSID = "Smart_Crop_Monitor";
+const char* AP_PASSWORD = "scms123";
+
+WebServer server(80);
+
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+#define DHT_PIN 26
+#define DHT_TYPE DHT11
+
+#define SOIL_PIN 33
+#define RAIN_PIN 35
+#define WATER_LEVEL_PIN 32
+
+#define RELAY_PIN 4
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+hd44780_I2Cexp lcd;
+
+
+// =====================================================
+// SOIL MOISTURE CALIBRATION
+// =====================================================
+
+int SOIL_DRY = 3200;
+int SOIL_WET = 1200;
+
+
+// =====================================================
+// RAIN SENSOR CALIBRATION
+// =====================================================
+
+int RAIN_DRY = 4095;
+int RAIN_WET = 1500;
+
+
+// =====================================================
+// WATER LEVEL SENSOR CALIBRATION
+// =====================================================
+// Sensor reads low when water is low, high when water
+// is high. Adjust these values after testing your sensor.
+// WATER_EMPTY = ADC reading when tank is empty
+// WATER_FULL  = ADC reading when tank is full
+
+int WATER_EMPTY = 0;
+int WATER_FULL = 2500;
+
+// Minimum water level (%) to allow pump operation.
+// Below this level the pump will NOT turn on to
+// prevent dry-running and save battery.
+int WATER_MIN_LEVEL = 15;
+
+
+// =====================================================
+// PLANT DATA STRUCTURE
+// =====================================================
+
+struct PlantProfile
+{
+  const char* name;
+  int code;
+  int pumpOnBelow;
+  int pumpOffAt;
+};
+
+
+// =====================================================
+// PLANT PROFILES (from sensor calibration data)
+// =====================================================
+
+// Plant 1: Portulaca           - Pump ON below 40%, Pump OFF at 72%
+// Plant 2: Moses-in-the-cradle - Pump ON below 55%, Pump OFF at 72%
+// Plant 3: Periwinkle          - Pump ON below 47%, Pump OFF at 72%
+
+PlantProfile plants[3] =
+{
+  { "Portulaca",            1, 40, 72 },
+  { "Moses-in-the-cradle",  2, 55, 72 },
+  { "Periwinkle",           3, 47, 72 }
+};
+
+
+// =====================================================
+// CURRENTLY SELECTED PLANT (0-indexed internally)
+// =====================================================
+
+int selectedPlant = 0;  // Default: Portulaca (code 1)
+
+int MOISTURE_THRESHOLD = 40;  // Pump ON below this
+int MOISTURE_STOP = 72;       // Pump OFF at this
+
+
+// =====================================================
+// RELAY SETTINGS
+// =====================================================
+
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
+
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+float temperature = 0;
+float humidity = 0;
+
+int soilRaw = 0;
+int rainRaw = 0;
+int waterRaw = 0;
+
+int soilMoisture = 0;
+int rainPercentage = 0;
+int waterLevel = 0;
+
+bool pumpStatus = false;
+bool waterLow = false;
+
+unsigned long readingCount = 0;
+
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+
+void startAccessPoint();
+
+void displaySensorData();
+
+void irrigationControl();
+
+void printSerialData();
+
+void handleRoot();
+
+void handleData();
+
+void handleSetPlant();
+
+void selectPlant(int plantCode);
+
+void checkSerialInput();
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // ---------------------------------------------------
+  // RELAY
+  // ---------------------------------------------------
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
+
+  // ---------------------------------------------------
+  // I2C
+  // ---------------------------------------------------
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+
+  // ---------------------------------------------------
+  // LCD
+  // ---------------------------------------------------
+
+  int status = lcd.begin(16, 2);
+
+  if (status)
+  {
+    Serial.print("LCD initialization failed, status = ");
+    Serial.println(status);
+
+    // Continue even if LCD fails.
+  }
+  else
+  {
+    lcd.backlight();
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("Smart Crop");
+
+    lcd.setCursor(0, 1);
+    lcd.print("System Starting");
+
+    delay(2000);
+  }
+
+
+  // ---------------------------------------------------
+  // DHT11
+  // ---------------------------------------------------
+
+  dht.begin();
+
+
+  // ---------------------------------------------------
+  // ADC
+  // ---------------------------------------------------
+
+  analogReadResolution(12);
+
+
+  // ---------------------------------------------------
+  // DEFAULT PLANT SELECTION
+  // ---------------------------------------------------
+
+  selectPlant(1);  // Default to Portulaca
+
+
+  // ---------------------------------------------------
+  // START ESP32 HOTSPOT
+  // ---------------------------------------------------
+
+  startAccessPoint();
+
+
+  // ---------------------------------------------------
+  // WEB SERVER
+  // ---------------------------------------------------
+
+  server.on("/", handleRoot);
+
+  server.on("/data", handleData);
+
+  server.on("/setplant", handleSetPlant);
+
+  server.begin();
+
+  Serial.println("Web server started.");
+
+
+  // ---------------------------------------------------
+  // SERIAL PLANT SELECTION INSTRUCTIONS
+  // ---------------------------------------------------
+
+  Serial.println();
+  Serial.println("=============================================");
+  Serial.println("PLANT SELECTION");
+  Serial.println("=============================================");
+  Serial.println("Send 1 = Portulaca (Pump ON < 40%, OFF >= 72%)");
+  Serial.println("Send 2 = Moses-in-the-cradle (Pump ON < 55%, OFF >= 72%)");
+  Serial.println("Send 3 = Periwinkle (Pump ON < 47%, OFF >= 72%)");
+  Serial.println("=============================================");
+  Serial.println();
+
+
+  // ---------------------------------------------------
+  // READY
+  // ---------------------------------------------------
+
+  if (status == 0)
+  {
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Ready");
+
+    lcd.setCursor(0, 1);
+    lcd.print("192.168.4.1");
+
+    delay(2000);
+  }
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // HANDLE WEB REQUESTS
+  // ---------------------------------------------------
+
+  server.handleClient();
+
+
+  // ---------------------------------------------------
+  // CHECK SERIAL INPUT FOR PLANT SELECTION
+  // ---------------------------------------------------
+
+  checkSerialInput();
+
+
+  // ---------------------------------------------------
+  // SOIL MOISTURE
+  // ---------------------------------------------------
+
+  soilRaw = analogRead(SOIL_PIN);
+
+  soilMoisture = map(
+    soilRaw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  soilMoisture = constrain(
+    soilMoisture,
+    0,
+    100
+  );
+
+
+  // ---------------------------------------------------
+  // RAIN SENSOR
+  // ---------------------------------------------------
+
+  rainRaw = analogRead(RAIN_PIN);
+
+  rainPercentage = map(
+    rainRaw,
+    RAIN_DRY,
+    RAIN_WET,
+    0,
+    100
+  );
+
+  rainPercentage = constrain(
+    rainPercentage,
+    0,
+    100
+  );
+
+
+  // ---------------------------------------------------
+  // WATER LEVEL SENSOR
+  // ---------------------------------------------------
+
+  waterRaw = analogRead(WATER_LEVEL_PIN);
+
+  waterLevel = map(
+    waterRaw,
+    WATER_EMPTY,
+    WATER_FULL,
+    0,
+    100
+  );
+
+  waterLevel = constrain(
+    waterLevel,
+    0,
+    100
+  );
+
+  // Check if water level is too low for pump operation
+  waterLow = (waterLevel < WATER_MIN_LEVEL);
+
+
+  // ---------------------------------------------------
+  // DHT11
+  // ---------------------------------------------------
+
+  humidity = dht.readHumidity();
+
+  temperature = dht.readTemperature();
+
+
+  if (isnan(humidity) || isnan(temperature))
+  {
+    Serial.println("DHT11 reading failed!");
+
+    delay(1000);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // INCREMENT READING COUNT
+  // ---------------------------------------------------
+
+  readingCount++;
+
+
+  // ---------------------------------------------------
+  // IRRIGATION CONTROL
+  // ---------------------------------------------------
+
+  irrigationControl();
+
+
+  // ---------------------------------------------------
+  // DISPLAY
+  // ---------------------------------------------------
+
+  displaySensorData();
+
+
+  // ---------------------------------------------------
+  // SERIAL MONITOR
+  // ---------------------------------------------------
+
+  printSerialData();
+
+
+  delay(2000);
+}
+
+
+// =====================================================
+// SELECT PLANT BY CODE (1, 2, or 3)
+// =====================================================
+
+void selectPlant(int plantCode)
+{
+  if (plantCode < 1 || plantCode > 3)
+  {
+    Serial.println("Invalid plant code. Use 1, 2, or 3.");
+    return;
+  }
+
+  selectedPlant = plantCode - 1;  // Convert to 0-indexed
+
+  MOISTURE_THRESHOLD = plants[selectedPlant].pumpOnBelow;
+  MOISTURE_STOP = plants[selectedPlant].pumpOffAt;
+
+  Serial.println();
+  Serial.println("=============================================");
+  Serial.print("PLANT SELECTED: ");
+  Serial.println(plants[selectedPlant].name);
+  Serial.print("Plant Code: ");
+  Serial.println(plants[selectedPlant].code);
+  Serial.print("Pump ON below: ");
+  Serial.print(MOISTURE_THRESHOLD);
+  Serial.println("%");
+  Serial.print("Pump OFF at: ");
+  Serial.print(MOISTURE_STOP);
+  Serial.println("%");
+  Serial.println("=============================================");
+  Serial.println();
+}
+
+
+// =====================================================
+// CHECK SERIAL INPUT FOR PLANT SELECTION
+// =====================================================
+
+void checkSerialInput()
+{
+  if (Serial.available() > 0)
+  {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    int plantCode = input.toInt();
+
+    if (plantCode >= 1 && plantCode <= 3)
+    {
+      selectPlant(plantCode);
+    }
+    else
+    {
+      Serial.println("Invalid input. Send 1, 2, or 3 to select a plant.");
+    }
+  }
+}
+
+
+// =====================================================
+// START ESP32 ACCESS POINT
+// =====================================================
+
+void startAccessPoint()
+{
+  Serial.println();
+  Serial.println("Starting ESP32 Wi-Fi Hotspot...");
+
+  WiFi.mode(WIFI_AP);
+
+  bool result = WiFi.softAP(
+    AP_SSID,
+    AP_PASSWORD
+  );
+
+  if (result)
+  {
+    Serial.println("Hotspot started successfully.");
+
+    Serial.print("Wi-Fi Name: ");
+    Serial.println(AP_SSID);
+
+    Serial.print("Wi-Fi Password: ");
+    Serial.println(AP_PASSWORD);
+
+    Serial.print("Dashboard IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+  else
+  {
+    Serial.println("Failed to start hotspot.");
+  }
+}
+
+
+// =====================================================
+// HANDLE SET PLANT FROM WEB
+// =====================================================
+
+void handleSetPlant()
+{
+  if (server.hasArg("code"))
+  {
+    int code = server.arg("code").toInt();
+
+    if (code >= 1 && code <= 3)
+    {
+      selectPlant(code);
+
+      server.send(
+        200,
+        "text/plain",
+        "OK"
+      );
+    }
+    else
+    {
+      server.send(
+        400,
+        "text/plain",
+        "Invalid plant code"
+      );
+    }
+  }
+  else
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing code parameter"
+    );
+  }
+}
+
+
+// =====================================================
+// WEB DASHBOARD
+// =====================================================
+
+void handleRoot()
+{
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Crop Monitoring System</title>
+<style>
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: #f0f7f2;
+  color: #2d3e35;
+  min-height: 100vh;
+}
+
+.container {
+  width: 94%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 0 40px;
+}
+
+/* HEADER */
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+  padding: 20px 28px;
+  background: #ffffff;
+  border-radius: 14px;
+  border: 1px solid #d4e8da;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.header h1 {
+  font-size: 26px;
+  font-weight: 700;
+  color: #1a5e32;
+  letter-spacing: 0.3px;
+}
+
+.header p {
+  margin-top: 4px;
+  font-size: 14px;
+  color: #6b8f7a;
+}
+
+.live-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #e8f5ec;
+  padding: 8px 16px;
+  border-radius: 24px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2a7a42;
+  border: 1px solid #c5e0cd;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  background: #34a853;
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* WATER ALERT BANNER */
+
+.water-alert {
+  display: none;
+  background: #fef2f2;
+  border: 2px solid #f87171;
+  border-radius: 14px;
+  padding: 16px 24px;
+  margin-bottom: 20px;
+  color: #991b1b;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.water-alert.show {
+  display: block;
+}
+
+/* INFO PANELS ROW */
+
+.info-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.info-panel {
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 20px 24px;
+  border: 1px solid #d4e8da;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.info-panel h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: #6b8f7a;
+  margin-bottom: 14px;
+  font-weight: 600;
+}
+
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.info-label {
+  font-size: 12px;
+  color: #8aaa97;
+  font-weight: 500;
+  margin-bottom: 3px;
+}
+
+.info-value {
+  font-size: 17px;
+  font-weight: 700;
+  color: #1a5e32;
+}
+
+.info-value.pump-on {
+  color: #d93025;
+}
+
+.info-value.pump-off {
+  color: #34a853;
+}
+
+.info-value.water-low {
+  color: #d93025;
+}
+
+.info-value.water-ok {
+  color: #34a853;
+}
+
+/* PLANT SELECTOR */
+
+.plant-selector {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.plant-btn {
+  padding: 8px 16px;
+  border: 2px solid #c5e0cd;
+  border-radius: 8px;
+  background: #f0f7f2;
+  color: #2d3e35;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.plant-btn:hover {
+  background: #dceee3;
+}
+
+.plant-btn.active {
+  background: #34a853;
+  color: #ffffff;
+  border-color: #34a853;
+}
+
+/* SENSOR CARDS ROW */
+
+.sensor-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.sensor-card {
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 20px;
+  border: 1px solid #d4e8da;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  text-align: center;
+}
+
+.sensor-card.alert {
+  border-color: #f87171;
+  background: #fef7f7;
+}
+
+.sensor-card .label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #6b8f7a;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.sensor-card .reading {
+  font-size: 36px;
+  font-weight: 700;
+  color: #1a5e32;
+}
+
+.sensor-card.alert .reading {
+  color: #d93025;
+}
+
+.sensor-card .unit {
+  font-size: 15px;
+  font-weight: 400;
+  color: #8aaa97;
+  margin-left: 2px;
+}
+
+.sensor-card .tag {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #e8f5ec;
+  color: #2a7a42;
+  border: 1px solid #c5e0cd;
+}
+
+.sensor-card .tag.warning {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #fca5a5;
+}
+
+/* GRAPH SECTION */
+
+.graph-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.graph-card {
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 20px;
+  border: 1px solid #d4e8da;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.graph-card h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #2d3e35;
+  margin-bottom: 12px;
+}
+
+.graph-card canvas {
+  width: 100%;
+  height: 180px;
+  display: block;
+}
+
+/* PUMP STATUS */
+
+.pump-section {
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 22px 28px;
+  border: 1px solid #d4e8da;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.pump-indicator {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.pump-indicator.on {
+  background: #34a853;
+  box-shadow: 0 0 16px rgba(52, 168, 83, 0.4);
+}
+
+.pump-indicator.off {
+  background: #9aa0a6;
+}
+
+.pump-indicator.blocked {
+  background: #d93025;
+  box-shadow: 0 0 16px rgba(217, 48, 37, 0.4);
+}
+
+.pump-info h3 {
+  font-size: 20px;
+  font-weight: 700;
+  color: #2d3e35;
+}
+
+.pump-info p {
+  margin-top: 4px;
+  font-size: 14px;
+  color: #6b8f7a;
+}
+
+/* FOOTER */
+
+.footer {
+  text-align: center;
+  color: #8aaa97;
+  font-size: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #d4e8da;
+}
+
+/* RESPONSIVE */
+
+@media (max-width: 900px) {
+  .sensor-row {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .graph-row {
+    grid-template-columns: 1fr;
+  }
+  .info-row {
+    grid-template-columns: 1fr;
+  }
+  .header h1 {
+    font-size: 20px;
+  }
+}
+
+@media (max-width: 550px) {
+  .sensor-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .pump-section {
+    flex-direction: column;
+    text-align: center;
+  }
+  .plant-selector {
+    flex-direction: column;
+  }
+}
+
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<!-- HEADER -->
+<div class="header">
+  <div>
+    <h1>SMART CROP MONITORING SYSTEM</h1>
+    <p>ESP32 - Local Agricultural Monitoring Dashboard</p>
+  </div>
+  <div class="live-badge">
+    <span class="live-dot"></span>
+    LIVE
+  </div>
+</div>
+
+<!-- WATER LOW ALERT BANNER -->
+<div class="water-alert" id="waterAlert">
+  WARNING: Tank water level is critically low! Pump is disabled to prevent dry-running and save battery.
+</div>
+
+<!-- PLANT INFO + SYSTEM STATUS -->
+<div class="info-row">
+
+  <div class="info-panel">
+    <h3>Plant Information</h3>
+    <div class="info-grid">
+      <div class="info-item">
+        <span class="info-label">Plant Name</span>
+        <span class="info-value" id="plantName">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Plant Code</span>
+        <span class="info-value" id="plantCode">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Pump ON Below</span>
+        <span class="info-value" id="thresholdOn">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Pump OFF At</span>
+        <span class="info-value" id="thresholdOff">--</span>
+      </div>
+    </div>
+    <div class="plant-selector">
+      <button class="plant-btn" onclick="setPlant(1)">1 - Portulaca</button>
+      <button class="plant-btn" onclick="setPlant(2)">2 - Moses-in-the-cradle</button>
+      <button class="plant-btn" onclick="setPlant(3)">3 - Periwinkle</button>
+    </div>
+  </div>
+
+  <div class="info-panel">
+    <h3>System Status</h3>
+    <div class="info-grid">
+      <div class="info-item">
+        <span class="info-label">System State</span>
+        <span class="info-value" id="sysStatus">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Total Readings</span>
+        <span class="info-value" id="readingCount">0</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Pump Status</span>
+        <span class="info-value" id="pumpState">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Tank Water</span>
+        <span class="info-value" id="waterState">--</span>
+      </div>
+    </div>
+    <div class="info-grid" style="margin-top:10px;">
+      <div class="info-item">
+        <span class="info-label">Last Update</span>
+        <span class="info-value" id="lastUpdate" style="font-size:14px;">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Min Water Level</span>
+        <span class="info-value" id="waterMinLevel">--</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- SENSOR READINGS -->
+<div class="sensor-row">
+  <div class="sensor-card">
+    <div class="label">Soil Moisture</div>
+    <div class="reading"><span id="soil">--</span><span class="unit">%</span></div>
+    <div class="tag" id="soilStatus">Waiting</div>
+  </div>
+  <div class="sensor-card">
+    <div class="label">Temperature</div>
+    <div class="reading"><span id="temperature">--</span><span class="unit">C</span></div>
+    <div class="tag" id="temperatureStatus">Waiting</div>
+  </div>
+  <div class="sensor-card">
+    <div class="label">Humidity</div>
+    <div class="reading"><span id="humidity">--</span><span class="unit">%</span></div>
+    <div class="tag">Air Humidity</div>
+  </div>
+  <div class="sensor-card">
+    <div class="label">Rain Detection</div>
+    <div class="reading"><span id="rain">--</span><span class="unit">%</span></div>
+    <div class="tag" id="rainStatus">Waiting</div>
+  </div>
+  <div class="sensor-card" id="waterCard">
+    <div class="label">Tank Water Level</div>
+    <div class="reading"><span id="water">--</span><span class="unit">%</span></div>
+    <div class="tag" id="waterStatus">Waiting</div>
+  </div>
+</div>
+
+<!-- PUMP STATUS BAR -->
+<div class="pump-section">
+  <div class="pump-indicator off" id="pumpCircle">OFF</div>
+  <div class="pump-info">
+    <h3 id="pumpLabel">Irrigation Pump - OFF</h3>
+    <p id="pumpReason">Waiting for sensor data...</p>
+  </div>
+</div>
+
+<!-- GRAPHS ROW 1 -->
+<div class="graph-row">
+  <div class="graph-card">
+    <h3>Temperature (C) - History</h3>
+    <canvas id="tempChart" height="180"></canvas>
+  </div>
+  <div class="graph-card">
+    <h3>Humidity (%) - History</h3>
+    <canvas id="humChart" height="180"></canvas>
+  </div>
+</div>
+
+<!-- GRAPHS ROW 2 -->
+<div class="graph-row">
+  <div class="graph-card">
+    <h3>Soil Moisture (%) - History</h3>
+    <canvas id="soilChart" height="180"></canvas>
+  </div>
+  <div class="graph-card">
+    <h3>Rain Detection (%) - History</h3>
+    <canvas id="rainChart" height="180"></canvas>
+  </div>
+</div>
+
+<!-- GRAPH ROW 3: WATER LEVEL -->
+<div class="graph-row">
+  <div class="graph-card" style="grid-column: span 2;">
+    <h3>Tank Water Level (%) - History</h3>
+    <canvas id="waterChart" height="180"></canvas>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+  Smart Crop Monitoring System | Dashboard hosted on ESP32 | Auto-refresh every 2 seconds
+</div>
+
+</div>
+
+<script>
+
+// Graph data arrays (max 30 readings)
+var MAX_PTS = 30;
+var tempData = [];
+var humData = [];
+var soilData = [];
+var rainData = [];
+var waterData = [];
+
+function drawGraph(canvasId, data, lineColor, minV, maxV, unit, thresholdLine) {
+  var c = document.getElementById(canvasId);
+  var ctx = c.getContext('2d');
+  var W = c.width = c.offsetWidth;
+  var H = c.height = 180;
+  var pad = {t:20, b:30, l:45, r:15};
+  var gW = W - pad.l - pad.r;
+  var gH = H - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Background
+  ctx.fillStyle = '#f8fcf9';
+  ctx.fillRect(pad.l, pad.t, gW, gH);
+
+  // Grid lines
+  ctx.strokeStyle = '#e0ece4';
+  ctx.lineWidth = 1;
+  for (var i = 0; i <= 4; i++) {
+    var y = pad.t + (gH / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(W - pad.r, y);
+    ctx.stroke();
+  }
+
+  // Threshold line (optional)
+  if (typeof thresholdLine !== 'undefined' && thresholdLine !== null) {
+    var ty = pad.t + gH - ((thresholdLine - minV) / (maxV - minV)) * gH;
+    ctx.strokeStyle = '#f87171';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, ty);
+    ctx.lineTo(W - pad.r, ty);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#d93025';
+    ctx.font = '10px Segoe UI, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('Min ' + thresholdLine + unit, pad.l + 4, ty - 4);
+  }
+
+  // Y-axis labels
+  ctx.fillStyle = '#6b8f7a';
+  ctx.font = '11px Segoe UI, sans-serif';
+  ctx.textAlign = 'right';
+  for (var i = 0; i <= 4; i++) {
+    var val = maxV - ((maxV - minV) / 4) * i;
+    var y = pad.t + (gH / 4) * i;
+    ctx.fillText(val.toFixed(0) + unit, pad.l - 6, y + 4);
+  }
+
+  if (data.length < 2) {
+    ctx.fillStyle = '#8aaa97';
+    ctx.font = '13px Segoe UI, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Collecting data...', W / 2, H / 2);
+    return;
+  }
+
+  // Draw line
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (var i = 0; i < data.length; i++) {
+    var x = pad.l + (gW / (MAX_PTS - 1)) * i;
+    var v = data[i];
+    if (v < minV) v = minV;
+    if (v > maxV) v = maxV;
+    var y = pad.t + gH - ((v - minV) / (maxV - minV)) * gH;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Fill area under line
+  ctx.lineTo(pad.l + (gW / (MAX_PTS - 1)) * (data.length - 1), pad.t + gH);
+  ctx.lineTo(pad.l, pad.t + gH);
+  ctx.closePath();
+  ctx.fillStyle = lineColor.replace(')', ',0.1)').replace('rgb', 'rgba');
+  ctx.fill();
+
+  // Data points
+  ctx.fillStyle = lineColor;
+  for (var i = 0; i < data.length; i++) {
+    var x = pad.l + (gW / (MAX_PTS - 1)) * i;
+    var v = data[i];
+    if (v < minV) v = minV;
+    if (v > maxV) v = maxV;
+    var y = pad.t + gH - ((v - minV) / (maxV - minV)) * gH;
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // X-axis label
+  ctx.fillStyle = '#8aaa97';
+  ctx.font = '11px Segoe UI, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Readings', W / 2, H - 4);
+}
+
+var storedWaterMin = 15;
+
+function setPlant(code) {
+  fetch('/setplant?code=' + code)
+  .then(function(r) { return r.text(); })
+  .then(function() { updateDashboard(); })
+  .catch(function(e) { console.log('Error:', e); });
+}
+
+function updateDashboard() {
+  fetch('/data')
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+
+    // Sensor values
+    document.getElementById('soil').innerHTML = data.soil;
+    document.getElementById('temperature').innerHTML = data.temperature;
+    document.getElementById('humidity').innerHTML = data.humidity;
+    document.getElementById('rain').innerHTML = data.rain;
+    document.getElementById('water').innerHTML = data.water;
+
+    // Status tags
+    document.getElementById('soilStatus').innerHTML = data.soilStatus;
+    document.getElementById('temperatureStatus').innerHTML = data.temperatureStatus;
+    document.getElementById('rainStatus').innerHTML = data.rainStatus;
+
+    // Water status tag
+    var waterTag = document.getElementById('waterStatus');
+    var waterCard = document.getElementById('waterCard');
+    waterTag.innerHTML = data.waterStatus;
+    if (data.waterLow) {
+      waterTag.className = 'tag warning';
+      waterCard.className = 'sensor-card alert';
+    } else {
+      waterTag.className = 'tag';
+      waterCard.className = 'sensor-card';
+    }
+
+    // Water alert banner
+    var alertBanner = document.getElementById('waterAlert');
+    if (data.waterLow) {
+      alertBanner.className = 'water-alert show';
+    } else {
+      alertBanner.className = 'water-alert';
+    }
+
+    // Plant info
+    document.getElementById('plantName').innerHTML = data.plantName;
+    document.getElementById('plantCode').innerHTML = data.plantCode;
+    document.getElementById('thresholdOn').innerHTML = data.thresholdOn + '%';
+    document.getElementById('thresholdOff').innerHTML = data.thresholdOff + '%';
+
+    // System status
+    document.getElementById('sysStatus').innerHTML = data.summary;
+    document.getElementById('readingCount').innerHTML = data.readings;
+    storedWaterMin = data.waterMinLevel;
+    document.getElementById('waterMinLevel').innerHTML = data.waterMinLevel + '%';
+
+    // Water state in system panel
+    var waterStateEl = document.getElementById('waterState');
+    waterStateEl.innerHTML = data.water + '% - ' + data.waterStatus;
+    if (data.waterLow) {
+      waterStateEl.className = 'info-value water-low';
+    } else {
+      waterStateEl.className = 'info-value water-ok';
+    }
+
+    // Pump
+    var pumpEl = document.getElementById('pumpCircle');
+    var pumpLabel = document.getElementById('pumpLabel');
+    var pumpStateEl = document.getElementById('pumpState');
+
+    if (data.waterLow) {
+      pumpEl.className = 'pump-indicator blocked';
+      pumpEl.innerHTML = 'OFF';
+      pumpLabel.innerHTML = 'Pump BLOCKED - Low Water';
+      pumpStateEl.innerHTML = 'BLOCKED';
+      pumpStateEl.className = 'info-value pump-on';
+    } else if (data.pump === 'ON') {
+      pumpEl.className = 'pump-indicator on';
+      pumpEl.innerHTML = 'ON';
+      pumpLabel.innerHTML = 'Irrigation Pump - ON';
+      pumpStateEl.innerHTML = 'ON';
+      pumpStateEl.className = 'info-value pump-on';
+    } else {
+      pumpEl.className = 'pump-indicator off';
+      pumpEl.innerHTML = 'OFF';
+      pumpLabel.innerHTML = 'Irrigation Pump - OFF';
+      pumpStateEl.innerHTML = 'OFF';
+      pumpStateEl.className = 'info-value pump-off';
+    }
+
+    document.getElementById('pumpReason').innerHTML = data.pumpReason;
+
+    // Plant selector buttons
+    var btns = document.querySelectorAll('.plant-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].className = 'plant-btn';
+    }
+    if (data.plantCode >= 1 && data.plantCode <= 3) {
+      btns[data.plantCode - 1].className = 'plant-btn active';
+    }
+
+    // Update graph data
+    tempData.push(parseFloat(data.temperature));
+    humData.push(parseFloat(data.humidity));
+    soilData.push(parseInt(data.soil));
+    rainData.push(parseInt(data.rain));
+    waterData.push(parseInt(data.water));
+
+    if (tempData.length > MAX_PTS) tempData.shift();
+    if (humData.length > MAX_PTS) humData.shift();
+    if (soilData.length > MAX_PTS) soilData.shift();
+    if (rainData.length > MAX_PTS) rainData.shift();
+    if (waterData.length > MAX_PTS) waterData.shift();
+
+    redrawAllGraphs();
+
+    // Last update
+    var now = new Date();
+    document.getElementById('lastUpdate').innerHTML = now.toLocaleTimeString();
+
+  })
+  .catch(function(e) { console.log('Connection error:', e); });
+}
+
+function redrawAllGraphs() {
+  drawGraph('tempChart', tempData, 'rgb(234, 67, 53)', 0, 50, ' C', null);
+  drawGraph('humChart', humData, 'rgb(66, 133, 244)', 0, 100, '%', null);
+  drawGraph('soilChart', soilData, 'rgb(52, 168, 83)', 0, 100, '%', null);
+  drawGraph('rainChart', rainData, 'rgb(99, 143, 210)', 0, 100, '%', null);
+  drawGraph('waterChart', waterData, 'rgb(14, 165, 233)', 0, 100, '%', storedWaterMin);
+}
+
+// Auto-refresh every 2 seconds
+setInterval(updateDashboard, 2000);
+
+// Initial load
+updateDashboard();
+
+// Redraw graphs on window resize
+window.addEventListener('resize', function() {
+  redrawAllGraphs();
+});
+
+</script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+
+// =====================================================
+// SEND SENSOR DATA AS JSON
+// =====================================================
+
+void handleData()
+{
+
+  // ---------------------------------------------------
+  // SOIL STATUS
+  // ---------------------------------------------------
+
+  String soilStatus;
+
+  if (soilMoisture <= MOISTURE_THRESHOLD)
+  {
+    soilStatus = "DRY";
+  }
+  else if (soilMoisture >= MOISTURE_STOP)
+  {
+    soilStatus = "WET";
+  }
+  else
+  {
+    soilStatus = "NORMAL";
+  }
+
+
+  // ---------------------------------------------------
+  // RAIN STATUS
+  // ---------------------------------------------------
+
+  String rainStatus;
+
+  if (rainPercentage >= 20)
+  {
+    rainStatus = "RAIN DETECTED";
+  }
+  else
+  {
+    rainStatus = "NO RAIN";
+  }
+
+
+  // ---------------------------------------------------
+  // TEMPERATURE STATUS
+  // ---------------------------------------------------
+
+  String temperatureStatus;
+
+  if (temperature < 20)
+  {
+    temperatureStatus = "COOL";
+  }
+  else if (temperature <= 35)
+  {
+    temperatureStatus = "NORMAL";
+  }
+  else
+  {
+    temperatureStatus = "HIGH";
+  }
+
+
+  // ---------------------------------------------------
+  // WATER LEVEL STATUS
+  // ---------------------------------------------------
+
+  String waterStatus;
+
+  if (waterLow)
+  {
+    waterStatus = "LOW - PUMP BLOCKED";
+  }
+  else if (waterLevel < 30)
+  {
+    waterStatus = "LOW";
+  }
+  else if (waterLevel < 60)
+  {
+    waterStatus = "MEDIUM";
+  }
+  else
+  {
+    waterStatus = "FULL";
+  }
+
+
+  // ---------------------------------------------------
+  // PUMP REASON
+  // ---------------------------------------------------
+
+  String pumpReason;
+
+  if (waterLow)
+  {
+    pumpReason =
+      "Pump is disabled. Tank water level is below ";
+    pumpReason += String(WATER_MIN_LEVEL);
+    pumpReason += "%. Refill the tank to resume irrigation.";
+  }
+  else if (pumpStatus)
+  {
+    pumpReason =
+      "Soil is dry and no significant rain detected.";
+  }
+  else if (rainPercentage >= 20)
+  {
+    pumpReason =
+      "Irrigation stopped because rain was detected.";
+  }
+  else if (soilMoisture >= MOISTURE_STOP)
+  {
+    pumpReason =
+      "Soil moisture is sufficient.";
+  }
+  else
+  {
+    pumpReason =
+      "Irrigation is currently on standby.";
+  }
+
+
+  // ---------------------------------------------------
+  // SUMMARY
+  // ---------------------------------------------------
+
+  String summary;
+
+  if (waterLow)
+  {
+    summary = "Water Low";
+  }
+  else if (pumpStatus)
+  {
+    summary = "Irrigating";
+  }
+  else if (rainPercentage >= 20)
+  {
+    summary = "Rain Detected";
+  }
+  else if (soilMoisture >= MOISTURE_STOP)
+  {
+    summary = "Moisture OK";
+  }
+  else
+  {
+    summary = "Monitoring";
+  }
+
+
+  // ---------------------------------------------------
+  // CREATE JSON
+  // ---------------------------------------------------
+
+  String json = "{";
+
+  json += "\"soil\":";
+  json += String(soilMoisture);
+
+  json += ",\"temperature\":";
+  json += String(temperature, 1);
+
+  json += ",\"humidity\":";
+  json += String(humidity, 1);
+
+  json += ",\"rain\":";
+  json += String(rainPercentage);
+
+  json += ",\"water\":";
+  json += String(waterLevel);
+
+  json += ",\"waterLow\":";
+  json += waterLow ? "true" : "false";
+
+  json += ",\"waterMinLevel\":";
+  json += String(WATER_MIN_LEVEL);
+
+  json += ",\"pump\":\"";
+  json += pumpStatus ? "ON" : "OFF";
+  json += "\"";
+
+  json += ",\"soilStatus\":\"";
+  json += soilStatus;
+  json += "\"";
+
+  json += ",\"rainStatus\":\"";
+  json += rainStatus;
+  json += "\"";
+
+  json += ",\"temperatureStatus\":\"";
+  json += temperatureStatus;
+  json += "\"";
+
+  json += ",\"waterStatus\":\"";
+  json += waterStatus;
+  json += "\"";
+
+  json += ",\"pumpReason\":\"";
+  json += pumpReason;
+  json += "\"";
+
+  json += ",\"summary\":\"";
+  json += summary;
+  json += "\"";
+
+  json += ",\"plantName\":\"";
+  json += plants[selectedPlant].name;
+  json += "\"";
+
+  json += ",\"plantCode\":";
+  json += String(plants[selectedPlant].code);
+
+  json += ",\"thresholdOn\":";
+  json += String(MOISTURE_THRESHOLD);
+
+  json += ",\"thresholdOff\":";
+  json += String(MOISTURE_STOP);
+
+  json += ",\"readings\":";
+  json += String(readingCount);
+
+  json += "}";
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================
+// LCD DISPLAY
+// =====================================================
+
+void displaySensorData()
+{
+
+  // ---------------------------------------------------
+  // FIRST LCD SCREEN: Sensor readings
+  // ---------------------------------------------------
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("Soil:");
+  lcd.print(soilMoisture);
+  lcd.print("%");
+
+  lcd.setCursor(9, 0);
+
+  lcd.print("Rain:");
+  lcd.print(rainPercentage);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C ");
+
+  lcd.print("H:");
+  lcd.print(humidity, 0);
+  lcd.print("%");
+
+  delay(1000);
+
+
+  // ---------------------------------------------------
+  // SECOND LCD SCREEN: Pump + Water Level
+  // ---------------------------------------------------
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("Pump:");
+
+  if (waterLow)
+  {
+    lcd.print("BLOCKED");
+  }
+  else if (pumpStatus)
+  {
+    lcd.print("ON");
+  }
+  else
+  {
+    lcd.print("OFF");
+  }
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("Water:");
+  lcd.print(waterLevel);
+  lcd.print("%");
+
+  if (waterLow)
+  {
+    lcd.print(" LOW!");
+  }
+
+  delay(1000);
+
+
+  // ---------------------------------------------------
+  // THIRD LCD SCREEN: Plant info
+  // ---------------------------------------------------
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("P:");
+  lcd.print(plants[selectedPlant].code);
+  lcd.print(" ");
+
+  // Show plant name (truncated to fit)
+  lcd.print(plants[selectedPlant].name);
+
+  lcd.setCursor(0, 1);
+
+  if (rainPercentage > 20)
+  {
+    lcd.print("Rain Detected");
+  }
+  else
+  {
+    lcd.print("No Rain");
+  }
+}
+
+
+// =====================================================
+// IRRIGATION CONTROL
+// =====================================================
+
+void irrigationControl()
+{
+
+  /*
+    PUMP ON conditions:
+      Soil moisture <= MOISTURE_THRESHOLD (plant-specific)
+      AND rain < 20%
+      AND water level >= WATER_MIN_LEVEL (tank has enough water)
+
+    PUMP OFF conditions:
+      Soil moisture >= MOISTURE_STOP (plant-specific)
+      OR rain >= 20%
+      OR water level < WATER_MIN_LEVEL (tank water too low)
+  */
+
+
+  // ---------------------------------------------------
+  // SAFETY CHECK: WATER LEVEL TOO LOW
+  // If tank water is below minimum, force pump OFF
+  // to prevent dry-running and save battery.
+  // ---------------------------------------------------
+
+  if (waterLow)
+  {
+    if (pumpStatus)
+    {
+      pumpStatus = false;
+
+      digitalWrite(
+        RELAY_PIN,
+        RELAY_OFF
+      );
+
+      Serial.println(
+        "IRRIGATION: PUMP OFF - WATER LEVEL TOO LOW!"
+      );
+    }
+
+    return;  // Skip normal irrigation logic
+  }
+
+
+  // ---------------------------------------------------
+  // PUMP ON
+  // ---------------------------------------------------
+
+  if (
+    soilMoisture <= MOISTURE_THRESHOLD &&
+    rainPercentage < 20
+  )
+  {
+    pumpStatus = true;
+
+    digitalWrite(
+      RELAY_PIN,
+      RELAY_ON
+    );
+
+    Serial.println(
+      "IRRIGATION: PUMP ON"
+    );
+  }
+
+
+  // ---------------------------------------------------
+  // PUMP OFF
+  // ---------------------------------------------------
+
+  else if (
+    soilMoisture >= MOISTURE_STOP ||
+    rainPercentage >= 20
+  )
+  {
+    pumpStatus = false;
+
+    digitalWrite(
+      RELAY_PIN,
+      RELAY_OFF
+    );
+
+    Serial.println(
+      "IRRIGATION: PUMP OFF"
+    );
+  }
+}
+
+
+// =====================================================
+// SERIAL MONITOR
+// =====================================================
+
+void printSerialData()
+{
+
+  Serial.println();
+
+  Serial.println(
+    "========== SENSOR DATA =========="
+  );
+
+  Serial.print("Plant: ");
+  Serial.print(plants[selectedPlant].name);
+  Serial.print(" (Code ");
+  Serial.print(plants[selectedPlant].code);
+  Serial.println(")");
+
+  Serial.print("Soil Raw Value: ");
+  Serial.println(soilRaw);
+
+  Serial.print("Soil Moisture: ");
+  Serial.print(soilMoisture);
+  Serial.println("%");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println("%");
+
+  Serial.print("Rain Raw Value: ");
+  Serial.println(rainRaw);
+
+  Serial.print("Rain: ");
+  Serial.print(rainPercentage);
+  Serial.println("%");
+
+  Serial.print("Water Raw Value: ");
+  Serial.println(waterRaw);
+
+  Serial.print("Water Level: ");
+  Serial.print(waterLevel);
+  Serial.print("% ");
+
+  if (waterLow)
+  {
+    Serial.println("[LOW - PUMP BLOCKED]");
+  }
+  else
+  {
+    Serial.println("[OK]");
+  }
+
+  Serial.print("Pump ON below: ");
+  Serial.print(MOISTURE_THRESHOLD);
+  Serial.println("%");
+
+  Serial.print("Pump OFF at: ");
+  Serial.print(MOISTURE_STOP);
+  Serial.println("%");
+
+  Serial.print("Pump: ");
+
+  if (waterLow)
+  {
+    Serial.println("BLOCKED (low water)");
+  }
+  else if (pumpStatus)
+  {
+    Serial.println("ON");
+  }
+  else
+  {
+    Serial.println("OFF");
+  }
+
+  Serial.print("Reading #: ");
+  Serial.println(readingCount);
+
+  Serial.println(
+    "================================="
+  );
+}
